@@ -1,4 +1,5 @@
 use std::io::{self, Write as _};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,12 +11,21 @@ use crossterm::terminal;
 enum State {
     Idle,
     Recording {
-        stream: Stream,
+        in_stream: Stream,
         buffer: Arc<Mutex<Vec<f32>>>,
-        channels: u16,
     },
     Looping {
-        stream: Stream,
+        out_stream: Stream,
+        loop_buf: Arc<Mutex<Vec<f32>>>,
+        play_pos: Arc<AtomicUsize>,
+        loop_frames: usize,
+    },
+    Overdubbing {
+        out_stream: Stream,
+        in_stream: Stream,
+        loop_buf: Arc<Mutex<Vec<f32>>>,
+        play_pos: Arc<AtomicUsize>,
+        loop_frames: usize,
     },
 }
 
@@ -58,38 +68,126 @@ fn build_input_stream(
     }
 }
 
+/// Mixes freshly captured audio into the loop buffer, starting at whatever
+/// frame the playback stream currently sits on, wrapping at `loop_frames`.
+fn mix_into_loop(
+    loop_buf: &Mutex<Vec<f32>>,
+    play_pos: &AtomicUsize,
+    loop_frames: usize,
+    channels: usize,
+    data: impl Iterator<Item = f32>,
+) {
+    if loop_frames == 0 {
+        return;
+    }
+    let mut buf = loop_buf.lock().unwrap();
+    let start_frame = play_pos.load(Ordering::Relaxed);
+    let mut frame_offset = 0usize;
+    let mut ch = 0usize;
+    for sample in data {
+        let frame = (start_frame + frame_offset) % loop_frames;
+        let idx = frame * channels + ch;
+        if let Some(existing) = buf.get_mut(idx) {
+            *existing = (*existing + sample).clamp(-1.0, 1.0);
+        }
+        ch += 1;
+        if ch == channels {
+            ch = 0;
+            frame_offset += 1;
+        }
+    }
+}
+
+fn build_overdub_input_stream(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    loop_buf: Arc<Mutex<Vec<f32>>>,
+    play_pos: Arc<AtomicUsize>,
+    loop_frames: usize,
+    channels: u16,
+) -> Result<Stream, cpal::BuildStreamError> {
+    let err_fn = |err| eprintln!("input stream error: {err}");
+    let stream_config = config.config();
+    let channels = channels as usize;
+
+    match config.sample_format() {
+        SampleFormat::F32 => device.build_input_stream(
+            &stream_config,
+            move |data: &[f32], _| {
+                mix_into_loop(&loop_buf, &play_pos, loop_frames, channels, data.iter().copied());
+            },
+            err_fn,
+            None,
+        ),
+        SampleFormat::I16 => device.build_input_stream(
+            &stream_config,
+            move |data: &[i16], _| {
+                mix_into_loop(
+                    &loop_buf,
+                    &play_pos,
+                    loop_frames,
+                    channels,
+                    data.iter().map(|s| s.to_sample::<f32>()),
+                );
+            },
+            err_fn,
+            None,
+        ),
+        SampleFormat::U16 => device.build_input_stream(
+            &stream_config,
+            move |data: &[u16], _| {
+                mix_into_loop(
+                    &loop_buf,
+                    &play_pos,
+                    loop_frames,
+                    channels,
+                    data.iter().map(|s| s.to_sample::<f32>()),
+                );
+            },
+            err_fn,
+            None,
+        ),
+        sample_format => panic!("unsupported input sample format: {sample_format}"),
+    }
+}
+
 fn build_output_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
-    recorded: Arc<Vec<f32>>,
+    loop_buf: Arc<Mutex<Vec<f32>>>,
+    play_pos: Arc<AtomicUsize>,
+    loop_frames: usize,
     recorded_channels: u16,
 ) -> Result<Stream, cpal::BuildStreamError> {
     let err_fn = |err| eprintln!("output stream error: {err}");
     let stream_config = config.config();
     let out_channels = stream_config.channels as usize;
     let rec_channels = recorded_channels as usize;
-    let total_frames = recorded.len() / rec_channels;
-    let mut frame: usize = 0;
 
-    let mut next_sample = move |out_channel: usize| -> f32 {
-        if total_frames == 0 {
-            return 0.0;
-        }
-        let src_channel = if rec_channels == 1 { 0 } else { out_channel % rec_channels };
-        let value = recorded[frame * rec_channels + src_channel];
-        if out_channel == out_channels - 1 {
-            frame = (frame + 1) % total_frames;
-        }
-        value
-    };
+    macro_rules! advance_frame {
+        ($frame:ident) => {{
+            $frame = ($frame + 1) % loop_frames.max(1);
+        }};
+    }
 
     match config.sample_format() {
         SampleFormat::F32 => device.build_output_stream(
             &stream_config,
             move |data: &mut [f32], _| {
-                for (i, sample) in data.iter_mut().enumerate() {
-                    *sample = next_sample(i % out_channels);
+                if loop_frames == 0 {
+                    data.fill(0.0);
+                    return;
                 }
+                let buf = loop_buf.lock().unwrap();
+                let mut frame = play_pos.load(Ordering::Relaxed);
+                for out_frame in data.chunks_mut(out_channels) {
+                    for (ch, sample) in out_frame.iter_mut().enumerate() {
+                        let src_channel = if rec_channels == 1 { 0 } else { ch % rec_channels };
+                        *sample = buf[frame * rec_channels + src_channel];
+                    }
+                    advance_frame!(frame);
+                }
+                play_pos.store(frame, Ordering::Relaxed);
             },
             err_fn,
             None,
@@ -97,9 +195,20 @@ fn build_output_stream(
         SampleFormat::I16 => device.build_output_stream(
             &stream_config,
             move |data: &mut [i16], _| {
-                for (i, sample) in data.iter_mut().enumerate() {
-                    *sample = next_sample(i % out_channels).to_sample::<i16>();
+                if loop_frames == 0 {
+                    data.fill(0);
+                    return;
                 }
+                let buf = loop_buf.lock().unwrap();
+                let mut frame = play_pos.load(Ordering::Relaxed);
+                for out_frame in data.chunks_mut(out_channels) {
+                    for (ch, sample) in out_frame.iter_mut().enumerate() {
+                        let src_channel = if rec_channels == 1 { 0 } else { ch % rec_channels };
+                        *sample = buf[frame * rec_channels + src_channel].to_sample::<i16>();
+                    }
+                    advance_frame!(frame);
+                }
+                play_pos.store(frame, Ordering::Relaxed);
             },
             err_fn,
             None,
@@ -107,9 +216,20 @@ fn build_output_stream(
         SampleFormat::U16 => device.build_output_stream(
             &stream_config,
             move |data: &mut [u16], _| {
-                for (i, sample) in data.iter_mut().enumerate() {
-                    *sample = next_sample(i % out_channels).to_sample::<u16>();
+                if loop_frames == 0 {
+                    data.fill(u16::MAX / 2);
+                    return;
                 }
+                let buf = loop_buf.lock().unwrap();
+                let mut frame = play_pos.load(Ordering::Relaxed);
+                for out_frame in data.chunks_mut(out_channels) {
+                    for (ch, sample) in out_frame.iter_mut().enumerate() {
+                        let src_channel = if rec_channels == 1 { 0 } else { ch % rec_channels };
+                        *sample = buf[frame * rec_channels + src_channel].to_sample::<u16>();
+                    }
+                    advance_frame!(frame);
+                }
+                play_pos.store(frame, Ordering::Relaxed);
             },
             err_fn,
             None,
@@ -146,7 +266,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!();
-    println!("SPACE: idle -> record -> loop -> idle    |    Esc/Ctrl+C: quit");
+    println!("SPACE: idle -> record -> loop -> overdub -> loop -> overdub -> ...");
+    println!("R: reset to idle (discard the current loop)    |    Esc/Ctrl+C: quit");
     println!();
 
     terminal::enable_raw_mode()?;
@@ -161,6 +282,7 @@ fn run(
     output_device: cpal::Device,
     output_config: cpal::SupportedStreamConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let recorded_channels = input_config.channels();
     let mut state = State::Idle;
 
     loop {
@@ -168,7 +290,18 @@ fn run(
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char(' ') => {
-                        state = advance(state, &input_device, &input_config, &output_device, &output_config)?;
+                        state = advance(
+                            state,
+                            &input_device,
+                            &input_config,
+                            &output_device,
+                            &output_config,
+                            recorded_channels,
+                        )?;
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        state = State::Idle;
+                        print_status("Reset. Press SPACE to record a new loop.");
                     }
                     KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
@@ -188,41 +321,80 @@ fn advance(
     input_config: &cpal::SupportedStreamConfig,
     output_device: &cpal::Device,
     output_config: &cpal::SupportedStreamConfig,
+    recorded_channels: u16,
 ) -> Result<State, Box<dyn std::error::Error>> {
     match state {
         State::Idle => {
             let buffer = Arc::new(Mutex::new(Vec::new()));
-            let stream = build_input_stream(input_device, input_config, buffer.clone())?;
-            stream.play()?;
+            let in_stream = build_input_stream(input_device, input_config, buffer.clone())?;
+            in_stream.play()?;
             print_status("Recording... press SPACE to stop and start looping.");
-            Ok(State::Recording {
-                stream,
-                buffer,
-                channels: input_config.channels(),
-            })
+            Ok(State::Recording { in_stream, buffer })
         }
-        State::Recording { stream, buffer, channels } => {
-            drop(stream); // stop capturing; buffer is now only referenced here
-            let recorded = Arc::new(
-                Arc::try_unwrap(buffer)
-                    .expect("input stream dropped, no other references remain")
-                    .into_inner()
-                    .unwrap(),
-            );
-            let frames = recorded.len() / channels.max(1) as usize;
-            if frames == 0 {
+        State::Recording { in_stream, buffer } => {
+            drop(in_stream); // stop capturing
+            let loop_frames = buffer.lock().unwrap().len() / recorded_channels.max(1) as usize;
+            if loop_frames == 0 {
                 print_status("Recorded nothing. Back to idle -- press SPACE to record.");
                 return Ok(State::Idle);
             }
-            let out_stream = build_output_stream(output_device, output_config, recorded, channels)?;
+            let play_pos = Arc::new(AtomicUsize::new(0));
+            let out_stream = build_output_stream(
+                output_device,
+                output_config,
+                buffer.clone(),
+                play_pos.clone(),
+                loop_frames,
+                recorded_channels,
+            )?;
             out_stream.play()?;
-            print_status("Looping! press SPACE to stop and go back to idle.");
-            Ok(State::Looping { stream: out_stream })
+            print_status("Looping! SPACE to overdub, R to reset.");
+            Ok(State::Looping {
+                out_stream,
+                loop_buf: buffer,
+                play_pos,
+                loop_frames,
+            })
         }
-        State::Looping { stream } => {
-            drop(stream); // stop playback
-            print_status("Stopped. Press SPACE to record a new loop.");
-            Ok(State::Idle)
+        State::Looping {
+            out_stream,
+            loop_buf,
+            play_pos,
+            loop_frames,
+        } => {
+            let in_stream = build_overdub_input_stream(
+                input_device,
+                input_config,
+                loop_buf.clone(),
+                play_pos.clone(),
+                loop_frames,
+                recorded_channels,
+            )?;
+            in_stream.play()?;
+            print_status("Overdubbing onto the loop... SPACE to stop overdubbing, R to reset.");
+            Ok(State::Overdubbing {
+                out_stream,
+                in_stream,
+                loop_buf,
+                play_pos,
+                loop_frames,
+            })
+        }
+        State::Overdubbing {
+            out_stream,
+            in_stream,
+            loop_buf,
+            play_pos,
+            loop_frames,
+        } => {
+            drop(in_stream); // stop capturing/mixing, keep the loop playing
+            print_status("Looping! SPACE to overdub, R to reset.");
+            Ok(State::Looping {
+                out_stream,
+                loop_buf,
+                play_pos,
+                loop_frames,
+            })
         }
     }
 }
