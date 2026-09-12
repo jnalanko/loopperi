@@ -68,11 +68,15 @@ fn build_input_stream(
     }
 }
 
-/// Mixes freshly captured audio into the loop buffer, starting at whatever
-/// frame the playback stream currently sits on, wrapping at `loop_frames`.
+/// Mixes freshly captured audio into the loop buffer starting at `write_frame`,
+/// advancing it (wrapping at `loop_frames`) as samples are consumed. The
+/// cursor is owned entirely by the overdub input stream -- it is seeded once
+/// from the playback position when overdubbing starts and then never
+/// re-synced, so a single overdub pass writes each loop frame exactly once
+/// even if the input and output streams' callback timings don't line up.
 fn mix_into_loop(
     loop_buf: &Mutex<Vec<f32>>,
-    play_pos: &AtomicUsize,
+    write_frame: &mut usize,
     loop_frames: usize,
     channels: usize,
     data: impl Iterator<Item = f32>,
@@ -81,12 +85,9 @@ fn mix_into_loop(
         return;
     }
     let mut buf = loop_buf.lock().unwrap();
-    let start_frame = play_pos.load(Ordering::Relaxed);
-    let mut frame_offset = 0usize;
     let mut ch = 0usize;
     for sample in data {
-        let frame = (start_frame + frame_offset) % loop_frames;
-        let idx = frame * channels + ch;
+        let idx = *write_frame * channels + ch;
         if let Some(existing) = buf.get_mut(idx) {
             // Leave headroom for the new layer, then soft-knee anything
             // that still peaks over +-1.0 instead of hard-clipping it.
@@ -96,7 +97,7 @@ fn mix_into_loop(
         ch += 1;
         if ch == channels {
             ch = 0;
-            frame_offset += 1;
+            *write_frame = (*write_frame + 1) % loop_frames;
         }
     }
 }
@@ -105,19 +106,20 @@ fn build_overdub_input_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     loop_buf: Arc<Mutex<Vec<f32>>>,
-    play_pos: Arc<AtomicUsize>,
+    start_frame: usize,
     loop_frames: usize,
     channels: u16,
 ) -> Result<Stream, cpal::BuildStreamError> {
     let err_fn = |err| eprintln!("input stream error: {err}");
     let stream_config = config.config();
     let channels = channels as usize;
+    let mut write_frame = if loop_frames == 0 { 0 } else { start_frame % loop_frames };
 
     match config.sample_format() {
         SampleFormat::F32 => device.build_input_stream(
             &stream_config,
             move |data: &[f32], _| {
-                mix_into_loop(&loop_buf, &play_pos, loop_frames, channels, data.iter().copied());
+                mix_into_loop(&loop_buf, &mut write_frame, loop_frames, channels, data.iter().copied());
             },
             err_fn,
             None,
@@ -127,7 +129,7 @@ fn build_overdub_input_stream(
             move |data: &[i16], _| {
                 mix_into_loop(
                     &loop_buf,
-                    &play_pos,
+                    &mut write_frame,
                     loop_frames,
                     channels,
                     data.iter().map(|s| s.to_sample::<f32>()),
@@ -141,7 +143,7 @@ fn build_overdub_input_stream(
             move |data: &[u16], _| {
                 mix_into_loop(
                     &loop_buf,
-                    &play_pos,
+                    &mut write_frame,
                     loop_frames,
                     channels,
                     data.iter().map(|s| s.to_sample::<f32>()),
@@ -369,7 +371,7 @@ fn advance(
                 input_device,
                 input_config,
                 loop_buf.clone(),
-                play_pos.clone(),
+                play_pos.load(Ordering::Relaxed),
                 loop_frames,
                 recorded_channels,
             )?;
