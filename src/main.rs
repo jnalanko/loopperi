@@ -88,7 +88,10 @@ fn mix_into_loop(
         let frame = (start_frame + frame_offset) % loop_frames;
         let idx = frame * channels + ch;
         if let Some(existing) = buf.get_mut(idx) {
-            *existing = (*existing + sample).clamp(-1.0, 1.0);
+            // Leave headroom for the new layer, then soft-knee anything
+            // that still peaks over +-1.0 instead of hard-clipping it.
+            let sum = *existing + sample * 0.8;
+            *existing = sum.tanh();
         }
         ch += 1;
         if ch == channels {
