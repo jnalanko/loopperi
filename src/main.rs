@@ -1,7 +1,7 @@
 use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream};
@@ -13,6 +13,7 @@ enum State {
     Recording {
         in_stream: Stream,
         buffer: Arc<Mutex<Vec<f32>>>,
+        started_at: Instant,
     },
     Looping {
         out_stream: Stream,
@@ -457,6 +458,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// isn't available to measure anything real (e.g. not on Linux/PulseAudio).
 const FALLBACK_LATENCY_MS: f64 = 30.0;
 const LATENCY_STEP_MS: f64 = 5.0;
+const DEFAULT_TRIM_MS: f64 = 85.0;
 
 /// Devices/configs/channel counts needed to build streams -- bundled up so
 /// `advance` doesn't have to take them all as separate arguments.
@@ -496,7 +498,7 @@ fn run(
         used_channels,
     };
     let mut state = State::Idle;
-    let mut trim_ms = 0.0;
+    let mut trim_ms = DEFAULT_TRIM_MS;
 
     // Combines the one-time input-path measurement with a freshly-read
     // output latency (output can change with buffer/route changes; input
@@ -539,9 +541,44 @@ fn run(
                 _ => {}
             }
         }
+        render_progress(&state);
     }
 
     Ok(())
+}
+
+const BAR_WIDTH: usize = 40;
+
+fn render_bar(fraction: f64, width: usize) -> String {
+    let filled = ((fraction.clamp(0.0, 1.0)) * width as f64).round() as usize;
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(width - filled))
+}
+
+/// Redraws a one-line, in-place progress indicator for the current state:
+/// elapsed time while recording (no known length yet), or a bar showing
+/// where playback currently sits within the loop otherwise. Uses `\r` plus
+/// a clear-to-end-of-line so it overwrites itself in place each tick rather
+/// than scrolling the terminal.
+fn render_progress(state: &State) {
+    match state {
+        State::Idle => {}
+        State::Recording { started_at, .. } => {
+            print!("\r\x1b[2KRecording... {:>5.1}s", started_at.elapsed().as_secs_f64());
+        }
+        State::Looping { play_pos, loop_frames, .. } => {
+            let fraction = play_pos.load(Ordering::Relaxed) as f64 / *loop_frames as f64;
+            print!("\r\x1b[2KLoop:    {} {:>3.0}%", render_bar(fraction, BAR_WIDTH), fraction * 100.0);
+        }
+        State::Overdubbing { play_pos, loop_frames, .. } => {
+            let fraction = play_pos.load(Ordering::Relaxed) as f64 / *loop_frames as f64;
+            print!(
+                "\r\x1b[2KOverdub: {} {:>3.0}% [REC]",
+                render_bar(fraction, BAR_WIDTH),
+                fraction * 100.0
+            );
+        }
+    }
+    io::stdout().flush().ok();
 }
 
 fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, Box<dyn std::error::Error>> {
@@ -557,9 +594,9 @@ fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, 
             )?;
             in_stream.play()?;
             print_status("Recording... press SPACE to stop and start looping.");
-            Ok(State::Recording { in_stream, buffer })
+            Ok(State::Recording { in_stream, buffer, started_at: Instant::now() })
         }
-        State::Recording { in_stream, buffer } => {
+        State::Recording { in_stream, buffer, .. } => {
             drop(in_stream); // stop capturing
             let loop_frames = buffer.lock().unwrap().len() / audio.used_channels.max(1) as usize;
             if loop_frames == 0 {
