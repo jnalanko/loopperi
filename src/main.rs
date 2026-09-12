@@ -437,7 +437,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("SPACE: idle -> record -> loop -> overdub -> loop -> overdub -> ...");
     println!("R: reset to idle (discard the current loop)    |    Esc/Ctrl+C: quit");
-    println!("[ / ]: nudge overdub timing earlier/later, on top of the auto-measured latency above");
+    println!("Left/Right arrows: nudge overdub timing earlier/later, on top of the auto-measured latency above");
     println!();
 
     terminal::enable_raw_mode()?;
@@ -498,36 +498,39 @@ fn run(
     let mut state = State::Idle;
     let mut trim_ms = 0.0;
 
+    // Combines the one-time input-path measurement with a freshly-read
+    // output latency (output can change with buffer/route changes; input
+    // doesn't, so it's just cached from the startup probe).
+    let auto_ms = || match (input_latency_ms, current_output_latency_ms()) {
+        (Some(i), Some(o)) => i + o,
+        (Some(i), None) => i,
+        (None, Some(o)) => o,
+        (None, None) => FALLBACK_LATENCY_MS,
+    };
+
     loop {
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char(' ') => {
-                        // Combine the one-time input-path measurement with a
-                        // freshly-read output latency (it changes with
-                        // buffer/route changes, input doesn't), plus the
-                        // user's manual trim on top of both.
-                        let auto_ms = match (input_latency_ms, current_output_latency_ms()) {
-                            (Some(i), Some(o)) => i + o,
-                            (Some(i), None) => i,
-                            (None, Some(o)) => o,
-                            (None, None) => FALLBACK_LATENCY_MS,
-                        };
-                        let latency_ms = auto_ms + trim_ms;
+                        let latency_ms = auto_ms() + trim_ms;
                         let latency_frames = (latency_ms / 1000.0 * sample_rate).round() as isize;
+                        if matches!(state, State::Looping { .. }) {
+                            print_status(&format!("Starting overdub with {latency_ms:.0} ms compensation"));
+                        }
                         state = advance(state, &audio, latency_frames)?;
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
                         state = State::Idle;
                         print_status("Reset. Press SPACE to record a new loop.");
                     }
-                    KeyCode::Char('[') => {
+                    KeyCode::Left => {
                         trim_ms -= LATENCY_STEP_MS;
-                        print_status(&format!("Overdub timing trim: {trim_ms:+.0} ms"));
+                        print_status(&format!("Overdub timing trim: {trim_ms:+.0} ms (total {:.0} ms)", auto_ms() + trim_ms));
                     }
-                    KeyCode::Char(']') => {
+                    KeyCode::Right => {
                         trim_ms += LATENCY_STEP_MS;
-                        print_status(&format!("Overdub timing trim: {trim_ms:+.0} ms"));
+                        print_status(&format!("Overdub timing trim: {trim_ms:+.0} ms (total {:.0} ms)", auto_ms() + trim_ms));
                     }
                     KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
