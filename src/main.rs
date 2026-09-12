@@ -293,11 +293,8 @@ fn build_output_stream(
 /// un-downmixed stream instead. Best-effort: returns `None` if `pactl` isn't
 /// present or parsing fails, and callers should fall back to the default.
 fn true_input_channel_count() -> Option<u16> {
-    let run = |args: &[&str]| -> Option<String> {
-        String::from_utf8(std::process::Command::new("pactl").args(args).output().ok()?.stdout).ok()
-    };
-    let default_source = run(&["get-default-source"])?.trim().to_string();
-    let sources = run(&["list", "sources"])?;
+    let default_source = pactl_run(&["get-default-source"])?.trim().to_string();
+    let sources = pactl_run(&["list", "sources"])?;
 
     let mut in_block = false;
     for line in sources.lines() {
@@ -312,6 +309,53 @@ fn true_input_channel_count() -> Option<u16> {
         }
     }
     None
+}
+
+fn pactl_run(args: &[&str]) -> Option<String> {
+    String::from_utf8(std::process::Command::new("pactl").args(args).output().ok()?.stdout).ok()
+}
+
+/// Parses the actual (not "configured") `Latency:` value, in milliseconds,
+/// out of `pactl list sinks`/`pactl list sources` output for the block whose
+/// `Name:` matches `device_name`. Only meaningful while something is
+/// actively connected to that sink/source -- it reads 0 when idle.
+fn pactl_actual_latency_ms(list_kind: &str, device_name: &str) -> Option<f64> {
+    let output = pactl_run(&["list", list_kind])?;
+    let mut in_block = false;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix("Name: ") {
+            in_block = name == device_name;
+        } else if in_block {
+            if let Some(rest) = line.strip_prefix("Latency: ") {
+                let usec: f64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(usec / 1000.0);
+            }
+        }
+    }
+    None
+}
+
+/// One-time startup measurement of the input path's round-trip latency: we
+/// can't read a source's actual latency from PulseAudio unless something is
+/// actively connected to it, so this briefly opens (and immediately closes)
+/// a real input stream purely to get a reading. The result is cached and
+/// reused for the rest of the session, since a device's input buffering
+/// latency doesn't change while it stays plugged in.
+fn probe_input_latency_ms(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    device_channels: u16,
+    used_channels: u16,
+) -> Option<f64> {
+    let default_source = pactl_run(&["get-default-source"])?.trim().to_string();
+    let scratch = Arc::new(Mutex::new(Vec::new()));
+    let probe_stream = build_input_stream(device, config, device_channels, used_channels, scratch).ok()?;
+    probe_stream.play().ok()?;
+    std::thread::sleep(Duration::from_millis(150));
+    let latency = pactl_actual_latency_ms("sources", &default_source);
+    drop(probe_stream);
+    latency
 }
 
 /// Finds a supported input config with exactly `channels` channels that also
@@ -381,15 +425,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Note: input/output sample rates differ, playback speed/pitch may be off (no resampling is done)."
         );
     }
+
+    print!("Measuring input latency... ");
+    io::stdout().flush().ok();
+    let input_latency_ms = probe_input_latency_ms(&input_device, &input_config, input_config.channels(), used_channels);
+    match input_latency_ms {
+        Some(ms) => println!("{ms:.1} ms"),
+        None => println!("couldn't measure (no PulseAudio?), using a fixed guess instead"),
+    }
+
     println!();
     println!("SPACE: idle -> record -> loop -> overdub -> loop -> overdub -> ...");
     println!("R: reset to idle (discard the current loop)    |    Esc/Ctrl+C: quit");
+    println!("[ / ]: nudge overdub timing earlier/later, on top of the auto-measured latency above");
     println!();
 
     terminal::enable_raw_mode()?;
-    let result = run(input_device, input_config, output_device, output_config, used_channels);
+    let result = run(
+        input_device,
+        input_config,
+        output_device,
+        output_config,
+        used_channels,
+        input_latency_ms,
+    );
     terminal::disable_raw_mode()?;
     result
+}
+
+/// Fallback round-trip latency guess, used only when PulseAudio's `pactl`
+/// isn't available to measure anything real (e.g. not on Linux/PulseAudio).
+const FALLBACK_LATENCY_MS: f64 = 30.0;
+const LATENCY_STEP_MS: f64 = 5.0;
+
+/// Devices/configs/channel counts needed to build streams -- bundled up so
+/// `advance` doesn't have to take them all as separate arguments.
+struct Audio {
+    input_device: cpal::Device,
+    input_config: cpal::SupportedStreamConfig,
+    output_device: cpal::Device,
+    output_config: cpal::SupportedStreamConfig,
+    device_channels: u16,
+    used_channels: u16,
+}
+
+/// Best-effort estimate of the current output (speaker/interface) latency:
+/// asks PulseAudio for the default sink's actual latency, which is live and
+/// accurate as long as something (our own playback stream) is actively
+/// connected to it -- true throughout Looping/Overdubbing.
+fn current_output_latency_ms() -> Option<f64> {
+    let default_sink = pactl_run(&["get-default-sink"])?.trim().to_string();
+    pactl_actual_latency_ms("sinks", &default_sink)
 }
 
 fn run(
@@ -398,28 +484,50 @@ fn run(
     output_device: cpal::Device,
     output_config: cpal::SupportedStreamConfig,
     used_channels: u16,
+    input_latency_ms: Option<f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let device_channels = input_config.channels();
+    let sample_rate = input_config.sample_rate().0 as f64;
+    let audio = Audio {
+        device_channels: input_config.channels(),
+        input_device,
+        input_config,
+        output_device,
+        output_config,
+        used_channels,
+    };
     let mut state = State::Idle;
+    let mut trim_ms = 0.0;
 
     loop {
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char(' ') => {
-                        state = advance(
-                            state,
-                            &input_device,
-                            &input_config,
-                            &output_device,
-                            &output_config,
-                            device_channels,
-                            used_channels,
-                        )?;
+                        // Combine the one-time input-path measurement with a
+                        // freshly-read output latency (it changes with
+                        // buffer/route changes, input doesn't), plus the
+                        // user's manual trim on top of both.
+                        let auto_ms = match (input_latency_ms, current_output_latency_ms()) {
+                            (Some(i), Some(o)) => i + o,
+                            (Some(i), None) => i,
+                            (None, Some(o)) => o,
+                            (None, None) => FALLBACK_LATENCY_MS,
+                        };
+                        let latency_ms = auto_ms + trim_ms;
+                        let latency_frames = (latency_ms / 1000.0 * sample_rate).round() as isize;
+                        state = advance(state, &audio, latency_frames)?;
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
                         state = State::Idle;
                         print_status("Reset. Press SPACE to record a new loop.");
+                    }
+                    KeyCode::Char('[') => {
+                        trim_ms -= LATENCY_STEP_MS;
+                        print_status(&format!("Overdub timing trim: {trim_ms:+.0} ms"));
+                    }
+                    KeyCode::Char(']') => {
+                        trim_ms += LATENCY_STEP_MS;
+                        print_status(&format!("Overdub timing trim: {trim_ms:+.0} ms"));
                     }
                     KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
@@ -433,23 +541,15 @@ fn run(
     Ok(())
 }
 
-fn advance(
-    state: State,
-    input_device: &cpal::Device,
-    input_config: &cpal::SupportedStreamConfig,
-    output_device: &cpal::Device,
-    output_config: &cpal::SupportedStreamConfig,
-    device_channels: u16,
-    used_channels: u16,
-) -> Result<State, Box<dyn std::error::Error>> {
+fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, Box<dyn std::error::Error>> {
     match state {
         State::Idle => {
             let buffer = Arc::new(Mutex::new(Vec::new()));
             let in_stream = build_input_stream(
-                input_device,
-                input_config,
-                device_channels,
-                used_channels,
+                &audio.input_device,
+                &audio.input_config,
+                audio.device_channels,
+                audio.used_channels,
                 buffer.clone(),
             )?;
             in_stream.play()?;
@@ -458,19 +558,19 @@ fn advance(
         }
         State::Recording { in_stream, buffer } => {
             drop(in_stream); // stop capturing
-            let loop_frames = buffer.lock().unwrap().len() / used_channels.max(1) as usize;
+            let loop_frames = buffer.lock().unwrap().len() / audio.used_channels.max(1) as usize;
             if loop_frames == 0 {
                 print_status("Recorded nothing. Back to idle -- press SPACE to record.");
                 return Ok(State::Idle);
             }
             let play_pos = Arc::new(AtomicUsize::new(0));
             let out_stream = build_output_stream(
-                output_device,
-                output_config,
+                &audio.output_device,
+                &audio.output_config,
                 buffer.clone(),
                 play_pos.clone(),
                 loop_frames,
-                used_channels,
+                audio.used_channels,
             )?;
             out_stream.play()?;
             print_status("Looping! SPACE to overdub, R to reset.");
@@ -487,14 +587,20 @@ fn advance(
             play_pos,
             loop_frames,
         } => {
+            // Audio captured "now" corresponds to what was heard roughly
+            // `latency_frames` ago (mic + speaker round-trip delay), so seed
+            // the overdub write cursor that far behind the current playback
+            // position instead of exactly on it.
+            let start_frame = (play_pos.load(Ordering::Relaxed) as isize - latency_frames)
+                .rem_euclid(loop_frames as isize) as usize;
             let in_stream = build_overdub_input_stream(
-                input_device,
-                input_config,
+                &audio.input_device,
+                &audio.input_config,
                 loop_buf.clone(),
-                play_pos.load(Ordering::Relaxed),
+                start_frame,
                 loop_frames,
-                device_channels,
-                used_channels,
+                audio.device_channels,
+                audio.used_channels,
             )?;
             in_stream.play()?;
             print_status("Overdubbing onto the loop... SPACE to stop overdubbing, R to reset.");
