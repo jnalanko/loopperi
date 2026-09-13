@@ -692,14 +692,15 @@ fn cancel(state: State) -> State {
     }
 }
 
-/// Prints a one-off status line, clearing whatever waveform line the
-/// previous `render_progress` may have left below it, and returns the
-/// cursor to the start of the status line -- keeping it ready for the next
-/// `render_progress` call regardless of how many lines the old state drew.
+/// Prints a one-off status line, clearing whatever waveform/bar lines the
+/// previous `render_progress` may have left below it, and leaves the cursor
+/// on the (now blank) line right below the message -- the block's home row
+/// -- so the next `render_progress` call draws there instead of clobbering
+/// the message itself.
 fn print_status(msg: &str) {
-    print!("\r\x1b[2K{msg}");
+    print!("\r\x1b[2K{msg}\r\n");
     for _ in 0..MAX_PROGRESS_LINES {
-        print!("\r\n\x1b[2K");
+        print!("\x1b[2K\r\n");
     }
     print!("\r\x1b[{MAX_PROGRESS_LINES}A");
     io::stdout().flush().ok();
