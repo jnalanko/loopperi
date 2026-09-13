@@ -27,6 +27,9 @@ enum State {
         loop_buf: Arc<Mutex<Vec<f32>>>,
         play_pos: Arc<AtomicUsize>,
         loop_frames: usize,
+        /// Snapshot of `loop_buf` taken right before overdubbing started, so
+        /// a cancelled overdub can be discarded by restoring it verbatim.
+        pre_overdub: Vec<f32>,
     },
 }
 
@@ -387,6 +390,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("SPACE: idle -> record -> loop -> overdub -> loop -> overdub -> ...");
     println!("R: reset to idle (discard the current loop)    |    Esc/Ctrl+C: quit");
+    println!("Backspace: cancel the current recording/overdub");
     println!("Left/Right arrows: nudge overdub timing earlier/later");
     println!();
 
@@ -456,6 +460,9 @@ fn run(
                         trim_ms += LATENCY_STEP_MS;
                         print_status(&format!("Overdub timing trim: {trim_ms:+.0} ms (total {:.0} ms)", BASE_LATENCY_MS + trim_ms));
                     }
+                    KeyCode::Backspace => {
+                        state = cancel(state);
+                    }
                     KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
                     _ => {}
@@ -484,31 +491,84 @@ fn render_bar(fraction: f64, width: usize, recording: bool) -> String {
     }
 }
 
-/// Redraws a one-line, in-place progress indicator for the current state:
-/// elapsed time while recording (no known length yet), or a bar showing
-/// where playback currently sits within the loop otherwise. Uses `\r` plus
-/// a clear-to-end-of-line so it overwrites itself in place each tick rather
-/// than scrolling the terminal.
+/// Row height of the waveform stem, in terminal lines.
+const WAVE_HEIGHT: usize = 9;
+/// Max number of lines `render_progress` can ever draw (waveform + bar),
+/// used by `print_status` to blank out any leftover lines below it.
+const MAX_PROGRESS_LINES: usize = WAVE_HEIGHT + 1;
+
+/// Renders a fixed-`width`, `WAVE_HEIGHT`-tall ASCII peak waveform of an
+/// interleaved `channels`-wide, `loop_frames`-long audio buffer: one column
+/// per width slot, bars growing up from a baseline, each column's height
+/// picked from the loudest sample (across all channels) in that column's
+/// slice of the loop. Returned top row first, so printing the array in order
+/// draws the stem right-side up.
+fn render_waveform_rows(buf: &[f32], loop_frames: usize, width: usize) -> [String; WAVE_HEIGHT] {
+    let levels: Vec<usize> = if let Some(channels) = buf.len().checked_div(loop_frames) {
+        (0..width)
+            .map(|col| {
+                let start = col * loop_frames / width;
+                let end = ((col + 1) * loop_frames / width).max(start + 1).min(loop_frames);
+                let peak = buf[start * channels..end * channels]
+                    .iter()
+                    .fold(0.0f32, |acc, s| acc.max(s.abs()));
+                (peak.min(1.0) * WAVE_HEIGHT as f32).round() as usize
+            })
+            .collect()
+    } else {
+        vec![0; width]
+    };
+    std::array::from_fn(|row| {
+        let threshold = WAVE_HEIGHT - row;
+        levels.iter().map(|&level| if level >= threshold { '#' } else { ' ' }).collect()
+    })
+}
+
+/// Redraws an in-place status block for the current state: for
+/// Looping/Overdubbing, a `WAVE_HEIGHT`-row waveform of what's actually
+/// audible right now, stacked above a progress bar showing where playback
+/// sits within the loop; for Recording, just an elapsed-time counter (there's
+/// no committed loop yet to visualize). During an overdub the waveform is
+/// drawn from `pre_overdub` -- the loop as it was *before* this take -- so
+/// the take being recorded doesn't show up until it's kept.
+///
+/// Leaves the cursor at the start of the block's first line so the next call
+/// (or `print_status`) can redraw it in place without scrolling.
 fn render_progress(state: &State) {
     match state {
         State::Idle => {}
         State::Recording { started_at, .. } => {
             print!("\r\x1b[2KRecording... {:>5.1}s", started_at.elapsed().as_secs_f64());
         }
-        State::Looping { play_pos, loop_frames, .. } => {
+        State::Looping { play_pos, loop_frames, loop_buf, .. } => {
             let fraction = play_pos.load(Ordering::Relaxed) as f64 / *loop_frames as f64;
-            print!("\r\x1b[2KLoop:    {} {:>3.0}%", render_bar(fraction, BAR_WIDTH, false), fraction * 100.0);
+            let bar_line = format!("Loop:    {} {:>3.0}%", render_bar(fraction, BAR_WIDTH, false), fraction * 100.0);
+            let rows = render_waveform_rows(&loop_buf.lock().unwrap(), *loop_frames, BAR_WIDTH);
+            print_wave_and_bar(&rows, &bar_line);
         }
-        State::Overdubbing { play_pos, loop_frames, .. } => {
+        State::Overdubbing { play_pos, loop_frames, pre_overdub, .. } => {
             let fraction = play_pos.load(Ordering::Relaxed) as f64 / *loop_frames as f64;
-            print!(
-                "\r\x1b[2KOverdub: {} {:>3.0}% {RED}[REC]{RESET}",
+            let bar_line = format!(
+                "Overdub: {} {:>3.0}% {RED}[REC]{RESET}",
                 render_bar(fraction, BAR_WIDTH, true),
                 fraction * 100.0
             );
+            let rows = render_waveform_rows(pre_overdub, *loop_frames, BAR_WIDTH);
+            print_wave_and_bar(&rows, &bar_line);
         }
     }
     io::stdout().flush().ok();
+}
+
+/// Prints `WAVE_HEIGHT` waveform rows followed by the bar line beneath them,
+/// then moves the cursor back up to the first waveform row.
+fn print_wave_and_bar(rows: &[String; WAVE_HEIGHT], bar_line: &str) {
+    print!("\r\x1b[2K         [{}]", rows[0]);
+    for row in &rows[1..] {
+        print!("\r\n\x1b[2K         [{row}]");
+    }
+    print!("\r\n\x1b[2K{bar_line}");
+    print!("\r\x1b[{WAVE_HEIGHT}A");
 }
 
 fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, Box<dyn std::error::Error>> {
@@ -563,6 +623,7 @@ fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, 
             // position instead of exactly on it.
             let start_frame = (play_pos.load(Ordering::Relaxed) as isize - latency_frames)
                 .rem_euclid(loop_frames as isize) as usize;
+            let pre_overdub = loop_buf.lock().unwrap().clone();
             let in_stream = build_overdub_input_stream(
                 &audio.input_device,
                 &audio.input_config,
@@ -580,6 +641,7 @@ fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, 
                 loop_buf,
                 play_pos,
                 loop_frames,
+                pre_overdub,
             })
         }
         State::Overdubbing {
@@ -588,6 +650,7 @@ fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, 
             loop_buf,
             play_pos,
             loop_frames,
+            pre_overdub: _,
         } => {
             drop(in_stream); // stop capturing/mixing, keep the loop playing
             print_status("Looping! SPACE to overdub, R to reset.");
@@ -601,7 +664,43 @@ fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, 
     }
 }
 
+/// Handles Backspace: aborts a take-in-progress and discards it, rather than
+/// keeping it like SPACE would. Recording -> Idle (the capture buffer is
+/// simply dropped); Overdubbing -> Looping with `loop_buf` restored to its
+/// pre-overdub snapshot, undoing whatever was mixed in so far. Any other
+/// state is left untouched.
+fn cancel(state: State) -> State {
+    match state {
+        State::Recording { .. } => {
+            print_status("Recording cancelled. Press SPACE to record a new loop.");
+            State::Idle
+        }
+        State::Overdubbing {
+            out_stream,
+            in_stream,
+            loop_buf,
+            play_pos,
+            loop_frames,
+            pre_overdub,
+        } => {
+            drop(in_stream); // stop capturing/mixing
+            *loop_buf.lock().unwrap() = pre_overdub;
+            print_status("Overdub cancelled. Looping! SPACE to overdub, R to reset.");
+            State::Looping { out_stream, loop_buf, play_pos, loop_frames }
+        }
+        other => other,
+    }
+}
+
+/// Prints a one-off status line, clearing whatever waveform line the
+/// previous `render_progress` may have left below it, and returns the
+/// cursor to the start of the status line -- keeping it ready for the next
+/// `render_progress` call regardless of how many lines the old state drew.
 fn print_status(msg: &str) {
-    print!("\r\x1b[2K{msg}\r\n");
+    print!("\r\x1b[2K{msg}");
+    for _ in 0..MAX_PROGRESS_LINES {
+        print!("\r\n\x1b[2K");
+    }
+    print!("\r\x1b[{MAX_PROGRESS_LINES}A");
     io::stdout().flush().ok();
 }
