@@ -402,7 +402,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Base round-trip latency (mic + speaker) assumed for overdub timing
 /// compensation, adjustable at runtime with Left/Right.
-const BASE_LATENCY_MS: f64 = 100.0;
+const BASE_LATENCY_MS: f64 = 80.0;
 const LATENCY_STEP_MS: f64 = 5.0;
 const DEFAULT_TRIM_MS: f64 = 0.0;
 
@@ -454,11 +454,11 @@ fn run(
                     }
                     KeyCode::Left => {
                         trim_ms -= LATENCY_STEP_MS;
-                        print_status(&format!("Overdub timing trim: {trim_ms:+.0} ms (total {:.0} ms)", BASE_LATENCY_MS + trim_ms));
+                        print_status(&format!("Overdub timing: {:.0} ms", BASE_LATENCY_MS + trim_ms));
                     }
                     KeyCode::Right => {
                         trim_ms += LATENCY_STEP_MS;
-                        print_status(&format!("Overdub timing trim: {trim_ms:+.0} ms (total {:.0} ms)", BASE_LATENCY_MS + trim_ms));
+                        print_status(&format!("Overdub timing: {:.0} ms", BASE_LATENCY_MS + trim_ms));
                     }
                     KeyCode::Backspace => {
                         state = cancel(state);
