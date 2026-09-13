@@ -402,7 +402,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Base round-trip latency (mic + speaker) assumed for overdub timing
 /// compensation, adjustable at runtime with Left/Right.
-const BASE_LATENCY_MS: f64 = 80.0;
+const BASE_LATENCY_MS: f64 = 90.0;
 const LATENCY_STEP_MS: f64 = 5.0;
 const DEFAULT_TRIM_MS: f64 = 0.0;
 
