@@ -549,9 +549,17 @@ fn run(
 
 const BAR_WIDTH: usize = 40;
 
-fn render_bar(fraction: f64, width: usize) -> String {
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
+fn render_bar(fraction: f64, width: usize, recording: bool) -> String {
     let filled = ((fraction.clamp(0.0, 1.0)) * width as f64).round() as usize;
-    format!("[{}{}]", "#".repeat(filled), "-".repeat(width - filled))
+    let bar = format!("[{}{}]", "#".repeat(filled), "-".repeat(width - filled));
+    if recording {
+        format!("{RED}{bar}{RESET}")
+    } else {
+        bar
+    }
 }
 
 /// Redraws a one-line, in-place progress indicator for the current state:
@@ -567,13 +575,13 @@ fn render_progress(state: &State) {
         }
         State::Looping { play_pos, loop_frames, .. } => {
             let fraction = play_pos.load(Ordering::Relaxed) as f64 / *loop_frames as f64;
-            print!("\r\x1b[2KLoop:    {} {:>3.0}%", render_bar(fraction, BAR_WIDTH), fraction * 100.0);
+            print!("\r\x1b[2KLoop:    {} {:>3.0}%", render_bar(fraction, BAR_WIDTH, false), fraction * 100.0);
         }
         State::Overdubbing { play_pos, loop_frames, .. } => {
             let fraction = play_pos.load(Ordering::Relaxed) as f64 / *loop_frames as f64;
             print!(
-                "\r\x1b[2KOverdub: {} {:>3.0}% [REC]",
-                render_bar(fraction, BAR_WIDTH),
+                "\r\x1b[2KOverdub: {} {:>3.0}% {RED}[REC]{RESET}",
+                render_bar(fraction, BAR_WIDTH, true),
                 fraction * 100.0
             );
         }
