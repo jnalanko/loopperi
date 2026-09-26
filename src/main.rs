@@ -1,20 +1,17 @@
 use std::io::{self, Write as _};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal;
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use crossterm::{execute, terminal};
 
 enum State {
-    Idle,
-    Recording {
-        in_stream: Stream,
-        buffer: Arc<Mutex<Vec<f32>>>,
-        started_at: Instant,
-    },
     Looping {
         out_stream: Stream,
         loop_buf: Arc<Mutex<Vec<f32>>>,
@@ -45,58 +42,6 @@ fn select_channels(
     data.enumerate()
         .filter(move |(i, _)| i % device_channels < used_channels)
         .map(|(_, s)| s)
-}
-
-fn build_input_stream(
-    device: &cpal::Device,
-    config: &cpal::SupportedStreamConfig,
-    device_channels: u16,
-    used_channels: u16,
-    buffer: Arc<Mutex<Vec<f32>>>,
-) -> Result<Stream, cpal::BuildStreamError> {
-    let err_fn = |err| eprintln!("input stream error: {err}");
-    let stream_config = config.config();
-    let device_channels = device_channels as usize;
-    let used_channels = used_channels as usize;
-
-    match config.sample_format() {
-        SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                let mut buf = buffer.lock().unwrap();
-                buf.extend(select_channels(data.iter().copied(), device_channels, used_channels));
-            },
-            err_fn,
-            None,
-        ),
-        SampleFormat::I16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[i16], _| {
-                let mut buf = buffer.lock().unwrap();
-                buf.extend(select_channels(
-                    data.iter().map(|s| s.to_sample::<f32>()),
-                    device_channels,
-                    used_channels,
-                ));
-            },
-            err_fn,
-            None,
-        ),
-        SampleFormat::U16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[u16], _| {
-                let mut buf = buffer.lock().unwrap();
-                buf.extend(select_channels(
-                    data.iter().map(|s| s.to_sample::<f32>()),
-                    device_channels,
-                    used_channels,
-                ));
-            },
-            err_fn,
-            None,
-        ),
-        sample_format => panic!("unsupported input sample format: {sample_format}"),
-    }
 }
 
 /// Identity below the threshold -- so mixing in silence never alters existing
@@ -200,6 +145,41 @@ fn build_overdub_input_stream(
     }
 }
 
+/// Click track derived from the tempo grid the loop was built on. It is mixed
+/// into the output stream only -- never into `loop_buf` -- so toggling it never
+/// alters the recorded material.
+struct Metronome {
+    enabled: AtomicBool,
+    frames_per_beat: usize,
+    beats_per_measure: usize,
+    /// Length of one click, in frames.
+    click_frames: usize,
+    sample_rate: f32,
+}
+
+impl Metronome {
+    fn toggle(&self) -> bool {
+        !self.enabled.fetch_xor(true, Ordering::Relaxed)
+    }
+
+    /// A decaying sine blip at the start of every beat, pitched higher on the
+    /// first beat of each measure so the downbeat is audible.
+    fn click_at(&self, frame: usize) -> f32 {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return 0.0;
+        }
+        let offset = frame % self.frames_per_beat;
+        if offset >= self.click_frames {
+            return 0.0;
+        }
+        let downbeat = (frame / self.frames_per_beat).is_multiple_of(self.beats_per_measure);
+        let freq = if downbeat { 1600.0 } else { 1000.0 };
+        let decay = 1.0 - offset as f32 / self.click_frames as f32;
+        let phase = std::f32::consts::TAU * freq * offset as f32 / self.sample_rate;
+        phase.sin() * decay * decay * 0.4
+    }
+}
+
 fn build_output_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
@@ -207,84 +187,58 @@ fn build_output_stream(
     play_pos: Arc<AtomicUsize>,
     loop_frames: usize,
     recorded_channels: u16,
+    metronome: Arc<Metronome>,
 ) -> Result<Stream, cpal::BuildStreamError> {
+    match config.sample_format() {
+        SampleFormat::F32 => {
+            build_output_stream_of::<f32>(device, config, loop_buf, play_pos, loop_frames, recorded_channels, metronome)
+        }
+        SampleFormat::I16 => {
+            build_output_stream_of::<i16>(device, config, loop_buf, play_pos, loop_frames, recorded_channels, metronome)
+        }
+        SampleFormat::U16 => {
+            build_output_stream_of::<u16>(device, config, loop_buf, play_pos, loop_frames, recorded_channels, metronome)
+        }
+        sample_format => panic!("unsupported output sample format: {sample_format}"),
+    }
+}
+
+fn build_output_stream_of<T>(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    loop_buf: Arc<Mutex<Vec<f32>>>,
+    play_pos: Arc<AtomicUsize>,
+    loop_frames: usize,
+    recorded_channels: u16,
+    metronome: Arc<Metronome>,
+) -> Result<Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
     let err_fn = |err| eprintln!("output stream error: {err}");
     let stream_config = config.config();
     let out_channels = stream_config.channels as usize;
     let rec_channels = recorded_channels as usize;
 
-    macro_rules! advance_frame {
-        ($frame:ident) => {{
-            $frame = ($frame + 1) % loop_frames.max(1);
-        }};
-    }
-
-    match config.sample_format() {
-        SampleFormat::F32 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _| {
-                if loop_frames == 0 {
-                    data.fill(0.0);
-                    return;
+    device.build_output_stream(
+        &stream_config,
+        move |data: &mut [T], _| {
+            let buf = loop_buf.lock().unwrap();
+            let mut frame = play_pos.load(Ordering::Relaxed);
+            for out_frame in data.chunks_mut(out_channels) {
+                let click = metronome.click_at(frame);
+                for (ch, sample) in out_frame.iter_mut().enumerate() {
+                    let src_channel = if rec_channels == 1 { 0 } else { ch % rec_channels };
+                    let value = buf[frame * rec_channels + src_channel] + click;
+                    *sample = soft_clip(value).to_sample::<T>();
                 }
-                let buf = loop_buf.lock().unwrap();
-                let mut frame = play_pos.load(Ordering::Relaxed);
-                for out_frame in data.chunks_mut(out_channels) {
-                    for (ch, sample) in out_frame.iter_mut().enumerate() {
-                        let src_channel = if rec_channels == 1 { 0 } else { ch % rec_channels };
-                        *sample = buf[frame * rec_channels + src_channel];
-                    }
-                    advance_frame!(frame);
-                }
-                play_pos.store(frame, Ordering::Relaxed);
-            },
-            err_fn,
-            None,
-        ),
-        SampleFormat::I16 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [i16], _| {
-                if loop_frames == 0 {
-                    data.fill(0);
-                    return;
-                }
-                let buf = loop_buf.lock().unwrap();
-                let mut frame = play_pos.load(Ordering::Relaxed);
-                for out_frame in data.chunks_mut(out_channels) {
-                    for (ch, sample) in out_frame.iter_mut().enumerate() {
-                        let src_channel = if rec_channels == 1 { 0 } else { ch % rec_channels };
-                        *sample = buf[frame * rec_channels + src_channel].to_sample::<i16>();
-                    }
-                    advance_frame!(frame);
-                }
-                play_pos.store(frame, Ordering::Relaxed);
-            },
-            err_fn,
-            None,
-        ),
-        SampleFormat::U16 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [u16], _| {
-                if loop_frames == 0 {
-                    data.fill(u16::MAX / 2);
-                    return;
-                }
-                let buf = loop_buf.lock().unwrap();
-                let mut frame = play_pos.load(Ordering::Relaxed);
-                for out_frame in data.chunks_mut(out_channels) {
-                    for (ch, sample) in out_frame.iter_mut().enumerate() {
-                        let src_channel = if rec_channels == 1 { 0 } else { ch % rec_channels };
-                        *sample = buf[frame * rec_channels + src_channel].to_sample::<u16>();
-                    }
-                    advance_frame!(frame);
-                }
-                play_pos.store(frame, Ordering::Relaxed);
-            },
-            err_fn,
-            None,
-        ),
-        sample_format => panic!("unsupported output sample format: {sample_format}"),
-    }
+                frame = (frame + 1) % loop_frames;
+            }
+            play_pos.store(frame, Ordering::Relaxed);
+        },
+        err_fn,
+        None,
+    )
 }
 
 /// On Linux/PulseAudio, `default_input_config()` can report fewer channels
@@ -353,7 +307,53 @@ fn pick_input_config_with_channels(
 /// on after the real analog inputs.
 const MAX_USED_CHANNELS: u16 = 2;
 
+/// Loop geometry asked for on the command line. A "beat" is the note value
+/// named by the time signature's denominator, which is also what the tempo
+/// counts -- so 90 6/8 means 90 eighth notes per minute, six to a measure.
+struct LoopSpec {
+    tempo_bpm: f64,
+    beats_per_measure: usize,
+    beat_unit: u32,
+    measures: usize,
+}
+
+fn parse_args() -> Result<LoopSpec, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let [tempo, time_signature, measures] = args.as_slice() else {
+        return Err("usage: loopperi <tempo-bpm> <time-signature> <measures>   (e.g. loopperi 120 4/4 4)".into());
+    };
+
+    let tempo_bpm: f64 = tempo.parse().map_err(|_| format!("invalid tempo: {tempo}"))?;
+    if !tempo_bpm.is_finite() || tempo_bpm <= 0.0 {
+        return Err(format!("tempo must be positive: {tempo}"));
+    }
+
+    let (beats, unit) = time_signature
+        .split_once('/')
+        .ok_or_else(|| format!("invalid time signature: {time_signature} (expected e.g. 4/4)"))?;
+    let beats_per_measure: usize = beats.parse().map_err(|_| format!("invalid time signature: {time_signature}"))?;
+    let beat_unit: u32 = unit.parse().map_err(|_| format!("invalid time signature: {time_signature}"))?;
+    if beats_per_measure == 0 || beat_unit == 0 {
+        return Err(format!("time signature parts must be positive: {time_signature}"));
+    }
+
+    let measures: usize = measures.parse().map_err(|_| format!("invalid measure count: {measures}"))?;
+    if measures == 0 {
+        return Err("measure count must be at least 1".into());
+    }
+
+    Ok(LoopSpec { tempo_bpm, beats_per_measure, beat_unit, measures })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = match parse_args() {
+        Ok(spec) => spec,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
+
     let host = cpal::default_host();
 
     let input_device = host
@@ -387,15 +387,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // The loop grid is measured against the output clock, since that is what
+    // paces playback and therefore the tempo you actually hear. Deriving the
+    // loop length from whole beats keeps the beat grid aligned across the wrap.
+    let playback_rate = output_config.sample_rate().0 as f64;
+    let frames_per_beat = (60.0 / spec.tempo_bpm * playback_rate).round() as usize;
+    let beats = spec.beats_per_measure * spec.measures;
+    let loop_frames = frames_per_beat * beats;
+
+    let metronome = Arc::new(Metronome {
+        enabled: AtomicBool::new(false),
+        frames_per_beat,
+        beats_per_measure: spec.beats_per_measure,
+        click_frames: (playback_rate * 0.02) as usize,
+        sample_rate: playback_rate as f32,
+    });
+
+    println!(
+        "Empty loop: {} BPM, {}/{}, {} measures ({} beats, {:.2} s)",
+        spec.tempo_bpm,
+        spec.beats_per_measure,
+        spec.beat_unit,
+        spec.measures,
+        beats,
+        loop_frames as f64 / playback_rate
+    );
+
     println!();
-    println!("SPACE: idle -> record -> loop -> overdub -> loop -> overdub -> ...");
-    println!("R: reset to idle (discard the current loop)    |    Esc/Ctrl+C: quit");
-    println!("Backspace: cancel the current recording/overdub");
+    println!("SPACE: start/stop overdubbing onto the loop");
+    println!("M: toggle the metronome    |    R: clear the loop    |    Esc/Ctrl+C: quit");
+    println!("Backspace: cancel the current overdub");
     println!("Left/Right arrows: nudge overdub timing earlier/later");
     println!();
 
     terminal::enable_raw_mode()?;
-    let result = run(input_device, input_config, output_device, output_config, used_channels);
+    // Ask for event-type reporting where the terminal supports it: without it
+    // a held key's auto-repeats are indistinguishable from fresh presses, so a
+    // slightly long press would toggle recording several times. With it,
+    // repeats arrive as `KeyEventKind::Repeat` and are ignored, leaving exactly
+    // one transition per physical key-down.
+    let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        )?;
+    }
+    let result = run(
+        input_device,
+        input_config,
+        output_device,
+        output_config,
+        used_channels,
+        loop_frames,
+        metronome,
+    );
+    if enhanced {
+        execute!(io::stdout(), PopKeyboardEnhancementFlags)?;
+    }
     terminal::disable_raw_mode()?;
     result
 }
@@ -423,6 +472,8 @@ fn run(
     output_device: cpal::Device,
     output_config: cpal::SupportedStreamConfig,
     used_channels: u16,
+    loop_frames: usize,
+    metronome: Arc<Metronome>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sample_rate = input_config.sample_rate().0 as f64;
     let audio = Audio {
@@ -433,7 +484,22 @@ fn run(
         output_config,
         used_channels,
     };
-    let mut state = State::Idle;
+
+    let loop_buf = Arc::new(Mutex::new(vec![0.0; loop_frames * used_channels as usize]));
+    let play_pos = Arc::new(AtomicUsize::new(0));
+    let out_stream = build_output_stream(
+        &audio.output_device,
+        &audio.output_config,
+        loop_buf.clone(),
+        play_pos.clone(),
+        loop_frames,
+        audio.used_channels,
+        metronome.clone(),
+    )?;
+    out_stream.play()?;
+    print_status("Empty loop running. SPACE to overdub, M for metronome.");
+
+    let mut state = State::Looping { out_stream, loop_buf, play_pos, loop_frames };
     let mut trim_ms = DEFAULT_TRIM_MS;
 
     loop {
@@ -448,9 +514,12 @@ fn run(
                         }
                         state = advance(state, &audio, latency_frames)?;
                     }
+                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                        let on = metronome.toggle();
+                        print_status(if on { "Metronome on." } else { "Metronome off." });
+                    }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
-                        state = State::Idle;
-                        print_status("Reset. Press SPACE to record a new loop.");
+                        state = clear(state);
                     }
                     KeyCode::Left => {
                         trim_ms -= LATENCY_STEP_MS;
@@ -524,22 +593,16 @@ fn render_waveform_rows(buf: &[f32], loop_frames: usize, width: usize) -> [Strin
     })
 }
 
-/// Redraws an in-place status block for the current state: for
-/// Looping/Overdubbing, a `WAVE_HEIGHT`-row waveform of what's actually
-/// audible right now, stacked above a progress bar showing where playback
-/// sits within the loop; for Recording, just an elapsed-time counter (there's
-/// no committed loop yet to visualize). During an overdub the waveform is
-/// drawn from `pre_overdub` -- the loop as it was *before* this take -- so
+/// Redraws an in-place status block for the current state: a `WAVE_HEIGHT`-row
+/// waveform of what's actually audible right now, stacked above a progress bar
+/// showing where playback sits within the loop. During an overdub the waveform
+/// is drawn from `pre_overdub` -- the loop as it was *before* this take -- so
 /// the take being recorded doesn't show up until it's kept.
 ///
 /// Leaves the cursor at the start of the block's first line so the next call
 /// (or `print_status`) can redraw it in place without scrolling.
 fn render_progress(state: &State) {
     match state {
-        State::Idle => {}
-        State::Recording { started_at, .. } => {
-            print!("\r\x1b[2KRecording... {:>5.1}s", started_at.elapsed().as_secs_f64());
-        }
         State::Looping { play_pos, loop_frames, loop_buf, .. } => {
             let fraction = play_pos.load(Ordering::Relaxed) as f64 / *loop_frames as f64;
             let bar_line = format!("Loop:    {} {:>3.0}%", render_bar(fraction, BAR_WIDTH, false), fraction * 100.0);
@@ -573,44 +636,6 @@ fn print_wave_and_bar(rows: &[String; WAVE_HEIGHT], bar_line: &str) {
 
 fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, Box<dyn std::error::Error>> {
     match state {
-        State::Idle => {
-            let buffer = Arc::new(Mutex::new(Vec::new()));
-            let in_stream = build_input_stream(
-                &audio.input_device,
-                &audio.input_config,
-                audio.device_channels,
-                audio.used_channels,
-                buffer.clone(),
-            )?;
-            in_stream.play()?;
-            print_status("Recording... press SPACE to stop and start looping.");
-            Ok(State::Recording { in_stream, buffer, started_at: Instant::now() })
-        }
-        State::Recording { in_stream, buffer, .. } => {
-            drop(in_stream); // stop capturing
-            let loop_frames = buffer.lock().unwrap().len() / audio.used_channels.max(1) as usize;
-            if loop_frames == 0 {
-                print_status("Recorded nothing. Back to idle -- press SPACE to record.");
-                return Ok(State::Idle);
-            }
-            let play_pos = Arc::new(AtomicUsize::new(0));
-            let out_stream = build_output_stream(
-                &audio.output_device,
-                &audio.output_config,
-                buffer.clone(),
-                play_pos.clone(),
-                loop_frames,
-                audio.used_channels,
-            )?;
-            out_stream.play()?;
-            print_status("Looping! SPACE to overdub, R to reset.");
-            Ok(State::Looping {
-                out_stream,
-                loop_buf: buffer,
-                play_pos,
-                loop_frames,
-            })
-        }
         State::Looping {
             out_stream,
             loop_buf,
@@ -634,7 +659,7 @@ fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, 
                 audio.used_channels,
             )?;
             in_stream.play()?;
-            print_status("Overdubbing onto the loop... SPACE to stop overdubbing, R to reset.");
+            print_status("Overdubbing onto the loop... SPACE to stop overdubbing, R to clear.");
             Ok(State::Overdubbing {
                 out_stream,
                 in_stream,
@@ -653,7 +678,7 @@ fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, 
             pre_overdub: _,
         } => {
             drop(in_stream); // stop capturing/mixing, keep the loop playing
-            print_status("Looping! SPACE to overdub, R to reset.");
+            print_status("Looping! SPACE to overdub, R to clear.");
             Ok(State::Looping {
                 out_stream,
                 loop_buf,
@@ -664,17 +689,28 @@ fn advance(state: State, audio: &Audio, latency_frames: isize) -> Result<State, 
     }
 }
 
-/// Handles Backspace: aborts a take-in-progress and discards it, rather than
-/// keeping it like SPACE would. Recording -> Idle (the capture buffer is
-/// simply dropped); Overdubbing -> Looping with `loop_buf` restored to its
-/// pre-overdub snapshot, undoing whatever was mixed in so far. Any other
-/// state is left untouched.
+/// Handles R: drops any overdub in progress and empties the loop, keeping its
+/// tempo grid and playback timeline intact -- the loop's length is fixed by the
+/// command line, so there is nothing to re-measure.
+fn clear(state: State) -> State {
+    let (out_stream, loop_buf, play_pos, loop_frames) = match state {
+        State::Looping { out_stream, loop_buf, play_pos, loop_frames } => (out_stream, loop_buf, play_pos, loop_frames),
+        State::Overdubbing { out_stream, in_stream, loop_buf, play_pos, loop_frames, .. } => {
+            drop(in_stream); // stop capturing/mixing
+            (out_stream, loop_buf, play_pos, loop_frames)
+        }
+    };
+    loop_buf.lock().unwrap().fill(0.0);
+    print_status("Loop cleared. SPACE to overdub, M for metronome.");
+    State::Looping { out_stream, loop_buf, play_pos, loop_frames }
+}
+
+/// Handles Backspace: aborts an overdub in progress and discards it, rather
+/// than keeping it like SPACE would -- `loop_buf` is restored to its
+/// pre-overdub snapshot, undoing whatever was mixed in so far. Looping is left
+/// untouched.
 fn cancel(state: State) -> State {
     match state {
-        State::Recording { .. } => {
-            print_status("Recording cancelled. Press SPACE to record a new loop.");
-            State::Idle
-        }
         State::Overdubbing {
             out_stream,
             in_stream,
@@ -685,7 +721,7 @@ fn cancel(state: State) -> State {
         } => {
             drop(in_stream); // stop capturing/mixing
             *loop_buf.lock().unwrap() = pre_overdub;
-            print_status("Overdub cancelled. Looping! SPACE to overdub, R to reset.");
+            print_status("Overdub cancelled. Looping! SPACE to overdub, R to clear.");
             State::Looping { out_stream, loop_buf, play_pos, loop_frames }
         }
         other => other,
